@@ -21,6 +21,61 @@ from recbox.matching.pytorch.models import MatchingModel
 from recbox.matching.pytorch.layers import EmbeddingDictLayer, EmbeddingLayer
 import torch.nn.functional as F
 import numpy as np
+import logging
+import multiprocessing as mp
+from recbox.utils.ann import FaissIndex
+from recbox.core.metrics import evaluate_block
+
+def evaluate_metrics(user_embs, 
+                     item_embs, 
+                     train_user2items, 
+                     valid_user2items, 
+                     query_indices,
+                     metrics,
+                     num_workers=1):
+    logging.info("Evaluating metrics for {} users.".format(len(user_embs)))
+    metric_funcs = []
+    max_topk = 0
+    for metric in metrics:
+        try:
+            metric_funcs.append(eval(metric))
+            max_topk = max(max_topk, int(metric.split("k=")[-1].strip(")")))
+        except:
+            raise NotImplementedError('metrics={} not implemented.'.format(metric))
+    
+    faiss_index = FaissIndex(item_embs, dim=item_embs.shape[-1])
+    chunk_size = min(1000, int(np.ceil(len(user_embs) / float(num_workers))))
+
+    if num_workers > 1:
+        pool = mp.Pool(processes=num_workers)
+        results = []
+        for idx in range(0, len(user_embs), chunk_size):
+            chunk_user_embs = user_embs[idx: (idx + chunk_size), :]
+            chunk_query_indices = query_indices[idx: (idx + chunk_size)]
+            results.append(pool.apply_async(evaluate_block, 
+                args=(chunk_user_embs, faiss_index, chunk_query_indices,
+                train_user2items, valid_user2items, metric_funcs, max_topk)))
+        try:
+            pool.close()
+            pool.join()
+            results = [res.get() for res in results]
+        except Exception as e:
+            pool.terminate()
+            logging.error("Error during multiprocessing: {}".format(e))
+            results = []
+    else:
+        results = []
+        for idx in range(0, len(user_embs), chunk_size):
+            chunk_user_embs = user_embs[idx: (idx + chunk_size), :]
+            chunk_query_indices = query_indices[idx: (idx + chunk_size)]
+            results += evaluate_block(chunk_user_embs, faiss_index, chunk_query_indices, train_user2items, 
+                                      valid_user2items, metric_funcs, max_topk)
+    
+    average_result = np.average(np.array(results), axis=0).tolist()
+    return_dict = dict(zip(metrics, average_result))
+    logging.info('[Metrics] ' + ' - '.join('{}: {:.6f}'.format(k, v) for k, v in zip(metrics, average_result)))
+
+    return return_dict
 
 
 class SimpleX(MatchingModel):
@@ -111,6 +166,28 @@ class SimpleX(MatchingModel):
         if self.enable_bias:
             item_vec = torch.cat([item_vec, self.item_bias(item_inputs)], dim=-1)
         return item_vec
+    
+    def evaluate(self, train_generator, valid_generator):
+        logging.info("Start evaluation...")
+        self.eval()  # set to evaluation mode
+        with torch.no_grad():
+            user_vecs = []
+            item_vecs = []
+            for user_batch in valid_generator.user_loader:
+                user_vec = self.user_tower(user_batch)
+                user_vecs.extend(user_vec.data.cpu().numpy())
+            for item_batch in valid_generator.item_loader:
+                item_vec = self.item_tower(item_batch)
+                item_vecs.extend(item_vec.data.cpu().numpy())
+            user_vecs = np.array(user_vecs, np.float64)
+            item_vecs = np.array(item_vecs, np.float64)
+            val_logs = evaluate_metrics(user_vecs,
+                                        item_vecs,
+                                        train_generator.user2items_dict,
+                                        valid_generator.user2items_dict,
+                                        valid_generator.query_indexes,
+                                        self._validation_metrics)
+            return val_logs
 
 
 class BehaviorAggregator(nn.Module):
