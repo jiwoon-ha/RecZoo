@@ -24,7 +24,7 @@ import numpy as np
 import logging
 import multiprocessing as mp
 from recbox.utils.ann import FaissIndex
-from recbox.core.metrics import evaluate_block
+from recbox.core.metrics import evaluate_block, Recall, nRecall, Precision, HitRate, NDCG, DCG, F1, MAP, MRR
 
 def evaluate_metrics(user_embs, 
                      item_embs, 
